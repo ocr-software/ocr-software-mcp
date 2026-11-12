@@ -1,0 +1,28 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.ocr-software/ocr-software-mcp",
+  "title": "ocr-software.com OCR",
+  "description": "Read PDFs and images with ocr-software.com: page count, job, text, Markdown, JSON, hOCR.",
+  "websiteUrl": "https://ocr-software.com/",
+  "repository": {
+    "url": "https://github.com/ocr-software/ocr-software-mcp",
+    "source": "github"
+  },
+  "version": "0.1.0",
+  "packages": [
+    {
+      "registryType": "pypi",
+      "registryBaseUrl": "https://pypi.org",
+      "identifier": "ocr-software-mcp",
+      "version": "0.1.0",
+      "runtimeHint": "uvx",
+      "transport": {"type": "stdio"},
+      "environmentVariables": [
+        {"name": "OCR_KEY", "description": "API key, starts with ocr_. Never shown to the model.", "isRequired": true, "isSecret": true},
+        {"name": "OCR_BASE_URL", "description": "Address of the service; for your own server e.g. http://127.0.0.1:8080.", "default": "https://api.ocr-software.com"},
+        {"name": "OCR_OUT_DIR", "description": "Folder where results are written.", "default": "ocr-results"},
+        {"name": "OCR_ALLOWED_DIR", "description": "Optional: read documents only from below this folder."}
+      ]
+    }
+  ]
+}
