@@ -26,3 +26,17 @@ def test_registry_checks_the_name_in_the_readme():
 
 def test_dependencies_are_pinned_exactly():
     assert PINNED.search((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+
+
+def test_package_version_is_the_same_as_in_pyproject():
+    from ocr_software_mcp import __version__
+    assert re.search(r'^version = "%s"$' % re.escape(__version__), (ROOT / "pyproject.toml").read_text(encoding="utf-8"), re.M)
+
+
+def test_publish_workflow_is_trusted_publishing_with_tests_and_tag_check_before_upload():
+    """Review 13.11.2026: no token, OIDC, environment pypi, release trigger, tag = version, tests before the upload step."""
+    wf = (ROOT / ".github" / "workflows" / "publish.yml").read_text(encoding="utf-8")
+    for needed in ("types: [published]", "id-token: write", "environment: pypi", "GITHUB_REF_NAME"):
+        assert needed in wf
+    assert "password" not in wf and "secrets." not in wf
+    assert wf.index("GITHUB_REF_NAME") < wf.index("pytest") < wf.index("twine check") < wf.index("gh-action-pypi-publish")

@@ -21,6 +21,8 @@ Five tools, each one API call. The API itself is described in the [API guide](ht
 | `job_status` | State and counts of a job (`GET /v1/jobs/{id}`), long poll up to 60 s. `done` does not mean every page worked: check `pages_failed` and `pages_not_run`. |
 | `get_result` | Fetches `json`, `text`, `md` or `hocr`, writes it to a file and returns the path and size, never the content. Results expire after about 24 hours. |
 
+`get_result` has no `pdf` format: a searchable PDF needs the original document and comes only from the `ocr-software` command line (`ocr-software scan.pdf --pipeline NAME@VERSION --format pdf -o out.pdf`).
+
 `job_budget` is the most the job may cost, as a whole number of millicents (1 EUR = 100000); the job stops before a page that would exceed it. If the operator set no prices, it has no effect, but the tool still requires a whole number of at least 1.
 
 Retries follow the agent guide: 429, 500, 503 and network errors up to 5 times with growing waits. A `Retry-After` over 60 seconds goes back to the human at once. Other 4xx errors are never retried.
@@ -64,6 +66,8 @@ Add this to `claude_desktop_config.json`, then restart. The file is in `~/Librar
 
 With pipx use `"command": "ocr-software-mcp"` and no `args`.
 
+On Windows, `uv` must be on the PATH that Claude Desktop sees (install it with `winget install astral-sh.uv`, then restart Claude Desktop); otherwise use `pipx` and `"command": "ocr-software-mcp"`.
+
 ### Claude Code
 
 ```
@@ -84,11 +88,12 @@ The names `OCR_SOFTWARE_API_KEY`, `OCR_SOFTWARE_BASE_URL` and `OCR_SOFTWARE_ALLO
 
 ## Tests
 
-A fake local service, no network and no key needed (in the monorepo the `ocr-software` package is found next to this folder):
+A fake local service, no network and no key needed. In a fresh clone, install the package with its test extra (this brings `mcp` and `ocr-software`), then run pytest:
 
 ```
-python -m venv .venv && .venv/bin/pip install mcp==1.30.0 pytest
-.venv/bin/python -m pytest -p no:cacheprovider .
+python -m venv .venv
+.venv/bin/pip install -e ".[test]"            # Windows: .venv\Scripts\pip install -e ".[test]"
+.venv/bin/python -m pytest -p no:cacheprovider .    # Windows: .venv\Scripts\python -m pytest -p no:cacheprovider .
 ```
 
 ## License

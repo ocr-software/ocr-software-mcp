@@ -6,13 +6,16 @@ build-backend = "setuptools.build_meta"
 name = "ocr-software-mcp"
 version = "0.1.0"
 description = "MCP server for the ocr-software.com OCR API: quote, submit, poll, fetch text, Markdown, JSON, hOCR."
-readme = {file = "README.md", content-type = "text/markdown"}
+readme = {file = "INSTALL.txt", content-type = "text/markdown"}
 license = "MIT"
 license-files = ["LICENSE"]
 requires-python = ">=3.10"
 dependencies = ["mcp==1.30.0", "ocr-software==0.1.0"]
 keywords = ["ocr", "mcp", "mcp-server", "pdf", "document-ai"]
 classifiers = ["Programming Language :: Python :: 3"]
+
+[project.optional-dependencies]
+test = ["pytest==9.0.2"]
 
 [project.urls]
 Homepage = "https://ocr-software.com/"

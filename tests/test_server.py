@@ -209,3 +209,10 @@ def test_document_checks_apply_here_too(fake, tmp_path, monkeypatch):
     with pytest.raises(ToolError, match="outside the allowed folder"):
         server.quote(str(inside / ".." / "b.pdf"), "p@1")
     assert fake.log == []
+
+
+def test_initialize_reports_our_version_and_the_order_of_the_tools():
+    """Customer test 12.11.2026: serverInfo said 1.30.0 (the SDK) and gave no instructions."""
+    options = server.mcp._mcp_server.create_initialization_options()
+    assert options.server_version == server.__version__ == "0.1.0"
+    assert "quote" in options.instructions and "human_confirmed" in options.instructions

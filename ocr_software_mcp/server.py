@@ -12,9 +12,15 @@ from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
 from ocr_software import Client, OcrError
 
+from . import __version__
+
 RESULT_EXT = {"json": "json", "text": "txt", "md": "md", "hocr": "hocr"}
 
-mcp = FastMCP("ocr-software")
+INSTRUCTIONS = ("Read PDFs and images with ocr-software.com. Order: list_pipelines (the human picks the pipeline), quote (page count, "
+                "nothing runs), show the quote to the human, only after a yes submit_job with human_confirmed=true, then job_status, get_result.")
+
+mcp = FastMCP("ocr-software", instructions=INSTRUCTIONS)
+mcp._mcp_server.version = __version__  # else initialize reports the version of the MCP SDK
 
 
 @contextlib.contextmanager
