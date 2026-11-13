@@ -1,8 +1,8 @@
 # OCR MCP server for ocr-software.com: let Claude, Cursor and other agents read PDFs and scans
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/banner-dark.svg">
-  <img alt="OCR for AI agents: an agent calls OCR and gets text, word box and confidence back" src="assets/banner-light.svg" width="100%">
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/ocr-software/ocr-software-mcp/main/assets/banner-dark.svg">
+  <img alt="OCR for AI agents: an agent calls OCR and gets text, word box and confidence back" src="https://raw.githubusercontent.com/ocr-software/ocr-software-mcp/main/assets/banner-light.svg" width="100%">
 </picture>
 
 Give your AI agent a way to read documents: this MCP server sends PDF, PNG, JPEG and TIFF files to the [ocr-software.com OCR API](https://ocr-software.com/) and writes the result (JSON with word boxes, text, Markdown or hOCR) to a file. The API is hosted in Helsinki, EU (Hetzner). It also works against the package on your own server, which takes the same calls: set `OCR_BASE_URL` to its address ([install guide](https://ocr-software.com/docs/install/)).
@@ -11,21 +11,24 @@ The server is small and strict by design. A person picks the pipeline, sees the 
 
 ## Tools
 
-Five tools, each one API call. The API itself is described in the [API guide](https://ocr-software.com/docs/api-guide/), the rules for agents in the [agent guide](https://ocr-software.com/docs/agents.md).
+Six tools. The API itself is described in the [API guide](https://ocr-software.com/docs/api-guide/), the rules for agents in the [agent guide](https://ocr-software.com/docs/agents.md). The normal path is three calls: `list_pipelines`, `quote`, `submit_job` with `wait_seconds` and `format`.
 
 | Tool | What it does |
 |---|---|
-| `list_pipelines` | Lists pipelines, formats and features (`GET /v1/catalog`, no key needed). The human picks the pipeline, the agent never does. |
-| `quote` | Dry run of `POST /v1/jobs`: returns the page count and warnings, and the price if the operator set prices. Nothing runs, nothing is billed. |
-| `submit_job` | Starts a real job. Needs `pipeline`, `job_budget` and `human_confirmed=true`, which the agent sets only after the human saw the quote. Sends an Idempotency-Key, so a retry never creates a second job or a second charge. |
-| `job_status` | State and counts of a job (`GET /v1/jobs/{id}`), long poll up to 60 s. `done` does not mean every page worked: check `pages_failed` and `pages_not_run`. |
-| `get_result` | Fetches `json`, `text`, `md` or `hocr`, writes it to a file and returns the path and size, never the content. Results expire after about 24 hours. |
+| `list_pipelines` | Short list: per pipeline one summary line (what it delivers, price per page in euros, when to choose another one), formats and features, and `default_pipeline` (the fastest and cheapest available one, used by `quote` when no pipeline is named), from `GET /v1/catalog` (no key needed); `detail=true` gives the full catalog. The human picks the pipeline, the agent never does. |
+| `quote` | Dry run of `POST /v1/jobs`. `pipeline` is optional: without it the default is used and `say_to_human` says so. Returns a `quote_id` and `say_to_human`, a plain sentence with the page count and the amounts in euros. While billing is off it says that you pay EUR 0.00 today, shows the list price for information only and names the fair-use page and the contact. Nothing runs, nothing is billed. The quote is bound to the file (hash), the pipeline, the dpi and the price, lives one hour in the memory of the server and is used up by one job. |
+| `submit_job` | Starts the job from the `quote_id`; the budget comes from the quote, so the agent never handles it. `human_confirmed=true` only after the human saw `say_to_human`; if the client supports it, leave it out and the client asks the human itself. `wait_seconds` (up to 300) waits for the end with progress messages, `format` then writes the result in the same call. Sends an Idempotency-Key, so a retry never creates a second job or a second charge. |
+| `job_status` | Waits up to `wait_seconds` (default 45) until the job is done, with progress messages, in one call. `done` does not mean every page worked: it says `problem` if pages failed or did not run. The queue block shows only while the job waits. |
+| `get_result` | Fetches `json`, `text`, `md`, `hocr` or `pdf` (searchable PDF, needs the original document), writes it to a file and returns the path, the size and a quick check: words, mean confidence, uncertain words and a note for pages that look multi-column or failed. With `pages` ("2-4") or `search` it returns text or matching lines instead of a file. Results expire after about 24 hours. |
+| `uncertain_words` | The words the OCR is least sure about: page, word, confidence, the other reading where the pipeline has two (`differs`), the box in pixels and the page size. The agent should check these against the image. |
 
-`get_result` has no `pdf` format: a searchable PDF needs the original document and comes only from the `ocr-software` command line (`ocr-software scan.pdf --pipeline NAME@VERSION --format pdf -o out.pdf`).
+`verified` (per word) and `safe_ok` (per page) in the JSON result are flags of the OCR service, not of this server. `verified` is true when a second reader confirmed the word: `scan-vlm-ctc@2` sets it where the character reader read the same text (`flag` ok); the other pipelines have one reader and leave it false. `safe_ok` is always false today (not calibrated), which says nothing against the page. Judge a word by `confidence` (0 to 1) and `flag`. `box` is `[x0, y0, x1, y1]` in pixels of the page image, origin top left; the page's `width`, `height` and `dpi` say which image, and PDF points are pixels * 72 / dpi. `uncertain_words` lists words with `confidence` below 0.9 (the really wrong words of the gold set sat at about 0.83) or a differing second reading.
 
-`job_budget` is the most the job may cost, as a whole number of millicents (1 EUR = 100000); the job stops before a page that would exceed it. If the operator set no prices, it has no effect, but the tool still requires a whole number of at least 1.
+Price: the API counts in millicents (100,000 millicents = 1 EUR); this server speaks euros. Today nothing is charged: `quote` says "you pay EUR 0.00 today", shows the list price for information and names the fair-use rules (https://ocr-software.com/legal/fair-usage/) and info@ocr-software.com for more volume.
 
-Retries follow the agent guide: 429, 500, 503 and network errors up to 5 times with growing waits. A `Retry-After` over 60 seconds goes back to the human at once. Other 4xx errors are never retried.
+The job budget is internal: `quote` gives the price in the plain sentence, the server sends the quoted price as the cap, and the job stops before a page that would exceed it. If the operator set no prices, no cap is sent.
+
+Retries follow the agent guide: 429, 500, 502, 503, 504 and network errors up to 5 times with growing waits. A `Retry-After` over 60 seconds goes back to the human at once. Other 4xx errors are never retried.
 
 ## Settings
 
@@ -33,14 +36,14 @@ Environment variables only.
 
 | Variable | Meaning |
 |---|---|
-| `OCR_KEY` | API key (starts with `ocr_`). Required except for `list_pipelines`. Never print it, never paste it into the chat. Get one at [ocr-software.com/order](https://ocr-software.com/order/). |
+| `OCR_KEY` (or `OCR_SOFTWARE_API_KEY`) | API key (starts with `ocr_`). Required except for `list_pipelines`. It belongs only in the `env` field of this server in the config of your client, not in the shell of the agent. Never print it, never paste it into the chat. Get one at [ocr-software.com/order](https://ocr-software.com/order/). |
 | `OCR_BASE_URL` | Default `https://api.ocr-software.com`. For a self-hosted service, for example `http://127.0.0.1:8080`. |
-| `OCR_OUT_DIR` | Where `get_result` writes. Default `./ocr-results`. An existing file is never overwritten (`j1-1.json` instead). |
+| `OCR_OUT_DIR` | Where `get_result` writes; if set, the agent cannot choose another folder. Default: the folder `ocr-results` next to the document, for an unknown job `~/Documents/ocr-results`, never the folder of the app. A relative value is relative to that place. Without it the agent may pass `out_dir` (inside `OCR_ALLOWED_DIR` if set). An existing file is never overwritten (`j1-1.json` instead). |
 | `OCR_ALLOWED_DIR` | Optional. `quote` and `submit_job` then read only files below this folder; symlinks and `..` do not escape. |
 
 ## Safety rules built in
 
-- The agent cannot start a paid job without `human_confirmed`, and the budget caps the cost: the job stops before a page that would exceed `job_budget`.
+- The agent cannot start a job without a `quote_id` and a yes of the human, and the quoted price caps the cost: the job stops before a page that would exceed it. A file that changed since the quote is refused.
 - Every document is checked locally before it is sent: PDF, PNG, JPEG or TIFF by its first bytes, a regular file, at most 100 MiB.
 - Results go to files, not into the conversation, so large documents do not fill the context.
 - The key is read from the environment and never appears in a tool result.
