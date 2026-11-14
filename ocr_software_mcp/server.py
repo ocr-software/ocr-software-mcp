@@ -488,10 +488,10 @@ async def get_result(job_id: Annotated[str, Field(description="from submit_job")
                      search: Annotated[str | None, Field(description="return the lines containing this text with page numbers, no file")] = None,
                      out_dir: Annotated[str | None, Field(description="folder for the file; not allowed if the human set OCR_OUT_DIR")] = None,
                      source_path: Annotated[str | None, Field(description="original document, needed for pdf after a restart of this server")] = None) -> dict:
-    """Result of a finished job. Default: write it to a file (format json, text, md, hocr or pdf) and return path, size and
+    """Result of a finished job. Default: write it to a file and return path, size and
     check: words, mean confidence and uncertain words per page, notes such as probably several columns. The content stays
-    out of the chat. pages ('3', '1-5') returns the text of those pages here, search returns the matching lines with
-    page numbers, neither writes a file (give neither format, out_dir nor source_path then). The file goes to ocr-results next to the document by default. pdf is a searchable PDF.
+    out of the chat. pages ('3', '1-5') returns those pages' text here, search the matching lines with page numbers;
+    neither writes a file. The file goes to ocr-results next to the document by default; pdf is searchable.
     Results expire after about 24 hours.
     In the json: confidence is 0 to 1, box is [x0,y0,x1,y1] in pixels of the page image (page width, height). verified (per word) is
     true only where a second reader confirmed it (scan-vlm-ctc@2); safe_ok (per page) is always false today. Judge by confidence."""

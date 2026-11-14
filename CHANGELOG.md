@@ -1,6 +1,8 @@
 # Changelog
 
-## 0.3.0
+## 0.3.1
+
+0.3.0 was not published: its release check failed on a size limit for tool descriptions. 0.3.1 is the same release with a shorter `get_result` description.
 
 Names in the output of `get_result` changed (see below). Needs `ocr-software` 0.1.3: the hint for turned pages now says why to switch.
 
