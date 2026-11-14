@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.3
+
+- `quote` and `submit_job` pass the warnings of the job answer on in `say_to_human` (one line each: why fewer pages run, or why an option does nothing).
+- The safety texts say what the server enforces and what the agent is only asked to do; the budget is called `job_budget`.
+- Needs `ocr-software` 0.1.2 (`ocr_software.advice.warning_lines`).
+
 ## 0.2.2
 
 - Same code as 0.2.0. Neither 0.2.0 nor 0.2.1 reached PyPI: two release tests checked a fixed file name and a fixed version number.

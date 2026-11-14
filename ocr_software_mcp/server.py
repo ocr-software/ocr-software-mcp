@@ -1,7 +1,8 @@
 """MCP server (stdio) for the ocr-software.com API. Thin wrapper: every tool is a few calls of the ocr-software package.
 
 Settings by environment only: OCR_KEY (never printed, never in a tool result), OCR_BASE_URL, OCR_OUT_DIR, OCR_ALLOWED_DIR.
-The names OCR_SOFTWARE_API_KEY, OCR_SOFTWARE_BASE_URL and OCR_SOFTWARE_ALLOWED_DIR of the package work too.
+The names OCR_SOFTWARE_API_KEY, OCR_SOFTWARE_BASE_URL and OCR_SOFTWARE_ALLOWED_DIR of the package work too and win if both are set
+(one order everywhere: the OCR_SOFTWARE_ name first, then the short OCR_ name).
 Retries, limits and document checks live in ocr_software.client (one copy for the CLI and this server).
 Spec of every path, field and error code: <base>/openapi.json and agents.md of the API.
 
@@ -16,6 +17,7 @@ import math
 import os
 import re
 import secrets
+import sys
 import time
 from pathlib import Path
 
@@ -26,7 +28,7 @@ from mcp.types import ClientCapabilities, ElicitationCapability
 from ocr_software import Client, OcrError
 from ocr_software.advice import default_pipeline, summary
 from ocr_software.advice import eur as _eur
-from ocr_software.advice import price_sentence as _price_sentence
+from ocr_software.advice import price_sentence as _price_sentence, warning_lines
 from ocr_software.client import read_document
 from pydantic import BaseModel, Field
 
@@ -43,8 +45,8 @@ UNCERTAIN_FLAGS = ("differs", "low_conf", "no_ctc", "not_in_model")  # flags of 
 INLINE_CHARS = 30000  # most text get_result(pages=...) returns in the chat
 MAX_REMEMBERED = 50
 
-INSTRUCTIONS = ("Read PDFs and images with ocr-software.com. Order: list_pipelines (show it with the default, the human picks the pipeline; without a choice quote uses the default and says so), quote (nothing runs; "
-                "show say_to_human to the human), after a yes submit_job(quote_id, human_confirmed=true, wait_seconds=45, format=...) "
+INSTRUCTIONS = ("Read PDFs and images with ocr-software.com. Order: list_pipelines (show it with the default; you are asked to let the human pick the pipeline; without a choice quote uses the default and says so), quote (nothing runs; "
+                "show say_to_human to the human), after a real yes of the human submit_job(quote_id, human_confirmed=true, wait_seconds=45, format=...) "
                 "(job_status if it is not done yet). Results go to files; get_result reads pages or searches without opening the file; "
                 "uncertain_words lists words to check against the page image.")
 
@@ -87,7 +89,7 @@ async def _call(func, *args, **kwargs):
 
 
 def _allowed_dir():
-    return os.environ.get("OCR_ALLOWED_DIR") or os.environ.get("OCR_SOFTWARE_ALLOWED_DIR")
+    return os.environ.get("OCR_SOFTWARE_ALLOWED_DIR") or os.environ.get("OCR_ALLOWED_DIR")  # same order as Client
 
 
 def _check_path(path):
@@ -132,6 +134,8 @@ def _job_view(job):
             view[k] = job[k]
     if job.get("charged_millicents"):
         view["charged"] = _eur(job["charged_millicents"])
+    if job.get("warnings"):  # the service gives them with the accepted job and the status: why fewer pages run, what is ignored
+        view["warnings"] = [w.get("message", w.get("code", "")) for w in job["warnings"]]
     queue = job.get("queue") or {}
     if job.get("state") == "running" and queue.get("pages_ahead"):
         view["queue"] = {k: queue[k] for k in ("position", "pages_ahead", "estimated_wait_seconds", "estimated_done_seconds") if k in queue}
@@ -370,7 +374,7 @@ def _check_format(fmt):
 async def list_pipelines(detail: bool = False) -> dict:
     """List what the service offers (no key needed): per pipeline one line (summary: what it delivers, price per page in euros,
     when to choose another one), formats and features, and default_pipeline: the fastest and cheapest available one, used when no pipeline is named. Show the available ones
-    to the human with the default and let the human pick; never choose a pipeline yourself. detail=true adds
+    to the human with the default; you are asked to let the human pick and not to choose a pipeline yourself. detail=true adds
     descriptions, capabilities, measurements and hardware (long, rarely needed)."""
     catalog = await _call(_client().catalog)
     if detail:
@@ -388,7 +392,7 @@ async def list_pipelines(detail: bool = False) -> dict:
 @mcp.tool()
 async def quote(file_path: str, pipeline: str | None = None, dpi: int | None = None) -> dict:
     """Dry run: nothing runs, nothing is billed. Returns quote_id, the page count and say_to_human, one sentence with the
-    price: show it to the human word for word and get a yes before submit_job. pipeline is name@version from list_pipelines; if the
+    price: you are asked to show it to the human word for word and get a yes before submit_job. pipeline is name@version from list_pipelines; if the
     human named none, leave it out: the default (fastest and cheapest available) is used and the sentence names it.
     The quote_id is for one document, one pipeline and one job."""
     _check_path(file_path)
@@ -400,12 +404,15 @@ async def quote(file_path: str, pipeline: str | None = None, dpi: int | None = N
     digest = hashlib.sha256(await _call(read_document, file_path, client.allowed_dir)).hexdigest()
     quote_id = "q_" + secrets.token_hex(6)
     q.setdefault("pipeline", pipeline)
-    sentence = _price_sentence(q)
+    notes = [w.get("message", w.get("code", "")) for w in q.get("warnings") or []]  # the human must see them
+    sentence = " ".join([_price_sentence(dict(q, pages_covered=q.get("pages", 0)) if notes else q)] + notes)  # a warning already says "other pages are not run"
     if chosen:
         sentence = "No pipeline was chosen, so the default is used: the fastest and cheapest available one. " + sentence
     _remember(_quotes, quote_id, {"path": file_path, "sha256": digest, "pipeline": pipeline, "dpi": dpi, "pages": q.get("pages", 0),
                                    "budget": q.get("price_millicents") or None, "sentence": sentence, "time": time.monotonic()})
     out = {"quote_id": quote_id, "pipeline": pipeline, "pages": q.get("pages"), "say_to_human": sentence}
+    for line in warning_lines(q):
+        print("ocr-software-mcp: " + line, file=sys.stderr)  # stdout is the protocol; stderr is the log of the client
     if q.get("warnings"):
         out["warnings"] = [w.get("message", w.get("code", "")) for w in q["warnings"]]
     return out
@@ -415,7 +422,7 @@ async def quote(file_path: str, pipeline: str | None = None, dpi: int | None = N
 async def submit_job(quote_id: str, human_confirmed: bool = False, wait_seconds: int = 0, format: str | None = None,
                      client_ref: str | None = None, out_dir: str | None = None, ctx: Context = None) -> dict:
     """Start the job of a quote (document, pipeline and price are bound to the quote_id; the budget is the quoted price).
-    Set human_confirmed=true only after the human saw say_to_human and agreed; if the client can ask the human itself it asks
+    You are asked to set human_confirmed=true only after the human saw say_to_human and really agreed (the server cannot check it); if the client can ask the human itself it asks
     when you leave it false. wait_seconds (0 to 300): hold until the job is done; format (json, text, md, hocr, pdf) then
     also saves the result like get_result. Without wait_seconds it returns at once: poll job_status, keep the job_id."""
     _check_format(format)

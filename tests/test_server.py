@@ -195,8 +195,10 @@ def test_price_sentence_for_every_case_and_both_answers_of_the_open_question():
 
 
 def test_quote_warnings_come_as_plain_sentences(fake, doc):
-    fake.scripted[("POST", "/v1/jobs")] = [(200, {}, dict(DRY, warnings=[{"code": "free_limit", "message": "free pages end"}]))]
-    assert call(server.quote, doc, "scan-ctc@2")["warnings"] == ["free pages end"]
+    fake.scripted[("POST", "/v1/jobs")] = [(200, {}, dict(DRY, pages_covered=10, warnings=[{"code": "free_limit", "message": "free pages end"}]))]
+    out = call(server.quote, doc, "scan-ctc@2")
+    assert out["warnings"] == ["free pages end"]
+    assert out["say_to_human"].endswith(" free pages end") and "Only" not in out["say_to_human"] and out["say_to_human"].startswith("42 pages with scan-ctc@2")
 
 
 def test_path_errors_name_the_real_problem(fake, tmp_path, monkeypatch):
@@ -371,6 +373,12 @@ def run_in_session(coro_factory, **session_args):
         async with create_connected_server_and_client_session(server.mcp, **session_args) as session:
             return await coro_factory(session)
     return asyncio.run(go())
+
+
+def test_job_view_passes_the_warnings_of_the_job_on():
+    view = server._job_view({"job_id": "j", "state": "running", "pages": 9, "warnings": [{"code": "job_budget", "message": "only 3 pages run"}]})
+    assert view["warnings"] == ["only 3 pages run"]
+    assert "warnings" not in server._job_view({"job_id": "j", "state": "running", "pages": 9})
 
 
 def test_submit_waits_reports_progress_and_saves_the_result_in_one_call(fake, doc):
@@ -667,3 +675,21 @@ def test_one_quote_id_starts_one_job_even_when_two_calls_run_at_once_and_a_faile
     results = asyncio.run(twice())
     assert sum(isinstance(r, dict) for r in results) == 1 and sum(isinstance(r, ToolError) for r in results) == 1
     assert len([r for r in fake.log if r["method"] == "POST"]) == 1
+
+
+def test_both_folder_names_set_the_ocr_software_name_wins_like_in_the_client(fake, tmp_path, monkeypatch):
+    (tmp_path / "ok").mkdir()
+    (tmp_path / "other").mkdir()
+    (tmp_path / "ok" / "a.pdf").write_bytes(PDF)
+    monkeypatch.setenv("OCR_SOFTWARE_ALLOWED_DIR", str(tmp_path / "ok"))
+    monkeypatch.setenv("OCR_ALLOWED_DIR", str(tmp_path / "other"))
+    assert server._allowed_dir() == str(tmp_path / "ok") == client_module.Client().allowed_dir
+    fake.scripted[("POST", "/v1/jobs")] = [(200, {}, DRY)]
+    call(server.quote, str(tmp_path / "ok" / "a.pdf"), "p@1")
+
+
+def test_quote_warnings_go_to_stderr_as_lines_and_stay_in_the_result(fake, doc, capsys):
+    fake.scripted[("POST", "/v1/jobs")] = [(200, {}, dict(DRY, warnings=[{"code": "dpi_ignored", "message": "dpi is ignored"}]))]
+    out = call(server.quote, doc, "p@1", 300)
+    assert out["warnings"] == ["dpi is ignored"]
+    assert "ocr-software-mcp: warning dpi_ignored: dpi is ignored" in capsys.readouterr().err
