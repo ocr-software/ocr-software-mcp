@@ -20,6 +20,7 @@ import secrets
 import sys
 import time
 from pathlib import Path
+from typing import Annotated
 
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
@@ -29,7 +30,7 @@ from ocr_software import Client, OcrError
 from ocr_software.advice import default_pipeline, summary
 from ocr_software.advice import eur as _eur
 from ocr_software.advice import price_sentence as _price_sentence, warning_lines
-from ocr_software.client import read_document
+from ocr_software.client import check_job_id, read_document
 from pydantic import BaseModel, Field
 
 from . import __version__
@@ -48,9 +49,9 @@ MAX_REMEMBERED = 50
 INSTRUCTIONS = ("Read PDFs and images with ocr-software.com. Order: list_pipelines (show it with the default; you are asked to let the human pick the pipeline; without a choice quote uses the default and says so), quote (nothing runs; "
                 "show say_to_human to the human), after a real yes of the human submit_job(quote_id, human_confirmed=true, wait_seconds=45, format=...) "
                 "(job_status if it is not done yet). Results go to files; get_result reads pages or searches without opening the file; "
-                "uncertain_words lists words to check against the page image.")
+                "uncertain_words lists words to check against the page image; cancel_job stops a job after a yes of the human.")
 
-mcp = FastMCP("ocr-software", instructions=INSTRUCTIONS)
+mcp = FastMCP("ocr-software", instructions=INSTRUCTIONS, log_level="ERROR")  # the SDK logs every request at INFO to stderr
 mcp._mcp_server.version = __version__  # else initialize reports the version of the MCP SDK
 
 _quotes = {}  # quote_id -> what the human was shown; one submit_job uses it up
@@ -110,17 +111,17 @@ def _check_path(path):
 
 
 class _Confirm(BaseModel):
-    confirm: bool = Field(description="Start the job")
+    confirm: bool = Field(description="Yes")
 
 
-async def _human_confirms(ctx, sentence):
+async def _human_confirms(ctx, sentence, question="Start the job?"):
     """True or False if the client can ask the human directly (MCP elicitation), None if it cannot."""
     if ctx is None:
         return None
     try:
         if not ctx.request_context.session.check_client_capability(ClientCapabilities(elicitation=ElicitationCapability())):
             return None
-        answer = await ctx.elicit(sentence + " Start the job?", _Confirm)
+        answer = await ctx.elicit(sentence + " " + question, _Confirm)
     except McpError:
         return None
     return answer.action == "accept" and answer.data.confirm
@@ -273,7 +274,7 @@ def _multi_column(words, width):
 
 
 def _summary(result):
-    """Words, mean confidence and uncertain words per page, and a note where something needs a look."""
+    """Words, mean confidence and the number of uncertain words per page, and a note where something needs a look."""
     rows, total, conf_sum, uncertain = [], 0, 0.0, 0
     for page in result.get("pages", []):
         words = _words(page)
@@ -293,11 +294,11 @@ def _summary(result):
             notes.append("low mean confidence")
         total, conf_sum, uncertain = total + len(words), conf_sum + sum(w["confidence"] for w in words), uncertain + unc
         rows.append({"page": page["page"], "words": len(words), "mean_confidence": None if mean is None else round(mean, 3),
-                     "uncertain_words": unc, **({"note": "; ".join(notes)} if notes else {})})
-    out = {"pages": len(rows), "words": total, "mean_confidence": round(conf_sum / total, 3) if total else None, "uncertain_words": uncertain}
+                     "uncertain": unc, **({"note": "; ".join(notes)} if notes else {})})
+    out = {"pages": len(rows), "words": total, "mean_confidence": round(conf_sum / total, 3) if total else None, "uncertain": uncertain}
     out["per_page"] = rows if len(rows) <= 8 else [r for r in rows if "note" in r]
     if uncertain:
-        out["check"] = ("uncertain_words lists them (confidence below %s or a differing reading); look at them in the page image "
+        out["next_step"] = ("the uncertain_words tool lists them (confidence below %s or a differing reading); look at them in the page image "
                         "before relying on them." % LOW_CONFIDENCE)
     return out
 
@@ -371,7 +372,7 @@ def _check_format(fmt):
 # ---- tools ----
 
 @mcp.tool()
-async def list_pipelines(detail: bool = False) -> dict:
+async def list_pipelines(detail: Annotated[bool, Field(description="true adds descriptions, capabilities, measurements and hardware (long)")] = False) -> dict:
     """List what the service offers (no key needed): per pipeline one line (summary: what it delivers, price per page in euros,
     when to choose another one), formats and features, and default_pipeline: the fastest and cheapest available one, used when no pipeline is named. Show the available ones
     to the human with the default; you are asked to let the human pick and not to choose a pipeline yourself. detail=true adds
@@ -390,7 +391,9 @@ async def list_pipelines(detail: bool = False) -> dict:
 
 
 @mcp.tool()
-async def quote(file_path: str, pipeline: str | None = None, dpi: int | None = None) -> dict:
+async def quote(file_path: Annotated[str, Field(description="absolute path of one PDF, PNG, JPEG or TIFF file")],
+                pipeline: Annotated[str | None, Field(description="name@version from list_pipelines; leave out if the human named none")] = None,
+                dpi: Annotated[int | None, Field(description="render resolution for PDF pages; leave out for the default")] = None) -> dict:
     """Dry run: nothing runs, nothing is billed. Returns quote_id, the page count and say_to_human, one sentence with the
     price: you are asked to show it to the human word for word and get a yes before submit_job. pipeline is name@version from list_pipelines; if the
     human named none, leave it out: the default (fastest and cheapest available) is used and the sentence names it.
@@ -419,12 +422,15 @@ async def quote(file_path: str, pipeline: str | None = None, dpi: int | None = N
 
 
 @mcp.tool()
-async def submit_job(quote_id: str, human_confirmed: bool = False, wait_seconds: int = 0, format: str | None = None,
-                     client_ref: str | None = None, out_dir: str | None = None, ctx: Context = None) -> dict:
+async def submit_job(quote_id: Annotated[str, Field(description="from quote; valid for one job, one hour")],
+                     human_confirmed: Annotated[bool, Field(description="true only after the human saw say_to_human and agreed")] = False,
+                     wait_seconds: Annotated[int, Field(description="0 to 300: hold until the job is done; 0 returns at once")] = 0,
+                     format: Annotated[str | None, Field(description="json, text, md, hocr or pdf: save the result when done (needs wait_seconds)")] = None,
+                     client_ref: Annotated[str | None, Field(description="your own reference, kept with the job")] = None,
+                     out_dir: Annotated[str | None, Field(description="folder for the result file; not allowed if the human set OCR_OUT_DIR")] = None, ctx: Context = None) -> dict:
     """Start the job of a quote (document, pipeline and price are bound to the quote_id; the budget is the quoted price).
     You are asked to set human_confirmed=true only after the human saw say_to_human and really agreed (the server cannot check it); if the client can ask the human itself it asks
-    when you leave it false. wait_seconds (0 to 300): hold until the job is done; format (json, text, md, hocr, pdf) then
-    also saves the result like get_result. Without wait_seconds it returns at once: poll job_status, keep the job_id."""
+    when you leave it false. With wait_seconds and format the result is saved like get_result. Without wait_seconds it returns at once: use job_status, keep the job_id."""
     _check_format(format)
     entry = _quotes.get(quote_id)
     if not entry or time.monotonic() - entry["time"] > QUOTE_TTL_S:
@@ -459,8 +465,10 @@ async def submit_job(quote_id: str, human_confirmed: bool = False, wait_seconds:
 
 
 @mcp.tool()
-async def job_status(job_id: str, wait_seconds: int = 45, format: str | None = None, out_dir: str | None = None,
-                     ctx: Context = None) -> dict:
+async def job_status(job_id: Annotated[str, Field(description="from submit_job")],
+                     wait_seconds: Annotated[int, Field(description="0 to 300: hold until the job is done")] = 45,
+                     format: Annotated[str | None, Field(description="json, text, md, hocr or pdf: save the result when done")] = None,
+                     out_dir: Annotated[str | None, Field(description="folder for the result file; not allowed if the human set OCR_OUT_DIR")] = None, ctx: Context = None) -> dict:
     """State and counts of a job. Holds until the job is done or wait_seconds (0 to 300) are over, and reports progress
     meanwhile: one call is enough, do not poll in a loop; if state is still running call again. When state is done, check
     problem (pages failed or not run) and tell the human. format (json, text, md, hocr, pdf) saves the result when done."""
@@ -474,13 +482,17 @@ async def job_status(job_id: str, wait_seconds: int = 45, format: str | None = N
 
 
 @mcp.tool()
-async def get_result(job_id: str, format: str | None = None, pages: str | None = None, search: str | None = None,
-                     out_dir: str | None = None, source_path: str | None = None) -> dict:
+async def get_result(job_id: Annotated[str, Field(description="from submit_job")],
+                     format: Annotated[str | None, Field(description="json (default), text, md, hocr or pdf; file output only")] = None,
+                     pages: Annotated[str | None, Field(description="like 3 or 1-5 or 2,4,7-9: return the text of these pages here, no file")] = None,
+                     search: Annotated[str | None, Field(description="return the lines containing this text with page numbers, no file")] = None,
+                     out_dir: Annotated[str | None, Field(description="folder for the file; not allowed if the human set OCR_OUT_DIR")] = None,
+                     source_path: Annotated[str | None, Field(description="original document, needed for pdf after a restart of this server")] = None) -> dict:
     """Result of a finished job. Default: write it to a file (format json, text, md, hocr or pdf) and return path, size and
     check: words, mean confidence and uncertain words per page, notes such as probably several columns. The content stays
     out of the chat. pages ('3', '1-5') returns the text of those pages here, search returns the matching lines with
-    page numbers, neither writes a file (give neither format, out_dir nor source_path then). out_dir: folder for the file, default ocr-results next to the document. pdf (searchable PDF)
-    needs the original: source_path, or the file of a job started by this server. Results expire after about 24 hours.
+    page numbers, neither writes a file (give neither format, out_dir nor source_path then). The file goes to ocr-results next to the document by default. pdf is a searchable PDF.
+    Results expire after about 24 hours.
     In the json: confidence is 0 to 1, box is [x0,y0,x1,y1] in pixels of the page image (page width, height). verified (per word) is
     true only where a second reader confirmed it (scan-vlm-ctc@2); safe_ok (per page) is always false today. Judge by confidence."""
     _check_format(format)
@@ -505,7 +517,33 @@ async def get_result(job_id: str, format: str | None = None, pages: str | None =
 
 
 @mcp.tool()
-async def uncertain_words(job_id: str, max_confidence: float = LOW_CONFIDENCE, limit: int = 20, pages: str | None = None) -> dict:
+async def cancel_job(job_id: Annotated[str, Field(description="from submit_job")],
+                     human_confirmed: Annotated[bool, Field(description="true only after the human agreed to cancel")] = False, ctx: Context = None) -> dict:
+    """Stop a running job, or delete the result of a finished one (DELETE /v1/jobs/{id}). You are asked to set human_confirmed=true only
+    after the human agreed (the server cannot check it). Pages already read stay charged; check job_status afterwards."""
+    check_job_id(job_id)
+    if not human_confirmed:
+        answer = await _human_confirms(ctx, "This stops job %s or deletes its result." % job_id, "Cancel it?")
+        if answer is None:
+            raise ToolError("Ask the human whether job %s may be cancelled and set human_confirmed only after a yes." % job_id)
+        if not answer:
+            raise ToolError("The human did not agree. Nothing was cancelled.")
+    raw, _ = await _call(_client()._call, "DELETE", "/v1/jobs/" + job_id)  # 202 with a body while it runs, 204 without once it is finished
+    _results.pop(job_id, None)
+    if not raw:
+        return {"job_id": job_id, "state": "deleted", "note": "the job was finished: its result is deleted."}
+    try:
+        state = json.loads(raw).get("state", "cancelling")
+    except (ValueError, AttributeError):
+        state = "cancelling"
+    return {"job_id": job_id, "state": state, "note": "the job stops after the page in progress: call job_status to see it done."}
+
+
+@mcp.tool()
+async def uncertain_words(job_id: Annotated[str, Field(description="from submit_job")],
+                          max_confidence: Annotated[float, Field(description="0 to 1: list words below this confidence")] = LOW_CONFIDENCE,
+                          limit: Annotated[int, Field(description="1 to 100: most words returned")] = 20,
+                          pages: Annotated[str | None, Field(description="like 3 or 1-5: only these pages")] = None) -> dict:
     """Words the OCR read with low confidence (below max_confidence, default 0.9: the words of the gold set that were really
     wrong sat at about 0.83) or flagged as differing readings (scan-vlm-ctc), least
     sure first: page, word, confidence, other_reading if there is a second one, and box [x0,y0,x1,y1] in pixels of the page

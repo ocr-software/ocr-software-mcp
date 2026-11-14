@@ -49,7 +49,7 @@ class Fake(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(raw)
 
-    do_GET = do_POST = _handle
+    do_GET = do_POST = do_DELETE = _handle
 
     def log_message(self, *args):
         pass
@@ -125,13 +125,40 @@ def quoted(fake, doc, dry=DRY):
 
 def test_tools_registered():
     names = {t.name for t in asyncio.run(server.mcp.list_tools())}
-    assert names == {"list_pipelines", "quote", "submit_job", "job_status", "get_result", "uncertain_words"}
+    assert names == {"list_pipelines", "quote", "submit_job", "job_status", "get_result", "uncertain_words", "cancel_job"}
 
 
 def test_tool_descriptions_stay_short():
     """Every description is read by the model on every start: keep them small (Desktop feedback 13.11.2026)."""
     tools = asyncio.run(server.mcp.list_tools())
     assert sum(len(json.dumps(t.model_dump())) for t in tools) < 9000
+
+
+def test_every_parameter_has_a_description_and_the_names_in_the_check_are_not_tool_names():
+    for tool in asyncio.run(server.mcp.list_tools()):
+        for name, prop in tool.inputSchema["properties"].items():
+            assert prop.get("description"), "%s.%s has no description" % (tool.name, name)
+    for key in server._summary(make_result()):
+        assert key not in {t.name for t in asyncio.run(server.mcp.list_tools())} | {"check"}
+
+
+def test_cancel_job_asks_the_human_and_maps_running_and_finished(fake):
+    with pytest.raises(ToolError, match="Ask the human"):
+        call(server.cancel_job, "j1")
+    assert not [r for r in fake.log if r["method"] == "DELETE"]
+    fake.scripted[("DELETE", "/v1/jobs/j1")] = [(202, {}, {"job_id": "j1", "state": "cancelling"}), (204, {}, b"")]
+    out = call(server.cancel_job, "j1", human_confirmed=True)
+    assert out["state"] == "cancelling" and fake.log[-1]["method"] == "DELETE" and fake.log[-1]["auth"] == "Bearer ocr_testkey"
+    assert call(server.cancel_job, "j1", human_confirmed=True)["state"] == "deleted"
+    fake.scripted[("DELETE", "/v1/jobs/nope")] = [err(404, "not_found")]
+    with pytest.raises(ToolError, match="not_found"):
+        call(server.cancel_job, "nope", human_confirmed=True)
+    with pytest.raises(Exception, match="invalid job_id"):
+        call(server.cancel_job, "../x", human_confirmed=True)
+
+
+def test_the_sdk_does_not_log_every_request_at_info():
+    assert server.mcp.settings.log_level == "ERROR"
 
 
 CATALOG = {"pipelines": [{"pipeline": "scan-ctc@2", "description": "d", "formats": ["json", "pdf"], "features": ["word_boxes"],
@@ -523,9 +550,9 @@ def test_check_counts_words_confidence_uncertain_words_and_flags_columns(fake):
     result["pages"][1] = make_result(2, columns=True)["pages"][1]
     fake.scripted[("GET", "/v1/jobs/j1/result")] = [(200, {}, json.dumps(result).encode())]
     check = call(server.get_result, "j1")["check"]
-    assert check["pages"] == 2 and check["words"] == 120 + 240 and check["uncertain_words"] == 2 and "uncertain_words lists" in check["check"]
+    assert check["pages"] == 2 and check["words"] == 120 + 240 and check["uncertain"] == 2 and "uncertain_words tool lists" in check["next_step"] and "check" not in check
     rows = {r["page"]: r for r in check["per_page"]}  # 2 pages: all listed
-    assert rows[1]["uncertain_words"] == 2 and "note" not in rows[1] and rows[1]["words"] == 120
+    assert rows[1]["uncertain"] == 2 and "note" not in rows[1] and rows[1]["words"] == 120
     assert "several columns" in rows[2]["note"] and rows[2]["mean_confidence"] == 0.99
 
 

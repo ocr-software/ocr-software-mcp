@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.3.0
+
+Names in the output of `get_result` changed (see below). Needs `ocr-software` 0.1.3: the hint for turned pages now says why to switch.
+
+
+- New tool `cancel_job` (`DELETE /v1/jobs/{id}`): stops a running job or deletes the result of a finished one, after a yes of the human (elicitation, or `human_confirmed=true`).
+- Every parameter has a `description` in the tool schema.
+- Result check of `get_result`: the counts are called `uncertain` (were `uncertain_words`, the name of a tool) and the hint inside `check` is called `next_step` (was `check.check`).
+- The server logs at ERROR only: no `Processing request of type ...` line on stderr per call.
+
 ## 0.2.3
 
 - `quote` and `submit_job` pass the warnings of the job answer on in `say_to_human` (one line each: why fewer pages run, or why an option does nothing).
