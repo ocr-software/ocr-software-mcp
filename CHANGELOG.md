@@ -1,8 +1,8 @@
 # Changelog
 
-## 0.2.1
+## 0.2.2
 
-- Same code as 0.2.0, which never reached PyPI: a release test read INSTALL.txt, which is README.md in the public repo.
+- Same code as 0.2.0. Neither 0.2.0 nor 0.2.1 reached PyPI: two release tests checked a fixed file name and a fixed version number.
 
 ## 0.2.0
 

@@ -624,7 +624,8 @@ def test_uncertain_words_checks_its_limits_and_the_pages(fake):
 def test_initialize_reports_our_version_and_the_order_of_the_tools():
     """Customer test 12.11.2026: serverInfo said 1.30.0 (the SDK) and gave no instructions."""
     options = server.mcp._mcp_server.create_initialization_options()
-    assert options.server_version == server.__version__ == "0.2.0"
+    pyproject = (Path(__file__).resolve().parent.parent / "pyproject.toml").read_text(encoding="utf-8")
+    assert options.server_version == server.__version__ and f'version = "{server.__version__}"' in pyproject
     assert "quote" in options.instructions and "human_confirmed" in options.instructions and "say_to_human" in options.instructions
 
 
