@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.1
+
+- Same code as 0.2.0, which never reached PyPI: a release test read INSTALL.txt, which is README.md in the public repo.
+
 ## 0.2.0
 
 Breaking:

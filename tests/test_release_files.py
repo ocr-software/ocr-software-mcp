@@ -20,7 +20,9 @@ def test_server_json_matches_pyproject_and_registry_rules():
 
 def test_registry_checks_the_name_in_the_readme():
     server = json.loads((ROOT / "server.json").read_text(encoding="utf-8"))
-    readme = (ROOT / "INSTALL.txt").read_text(encoding="utf-8")
+    # Im privaten Repo heisst sie INSTALL.txt, im oeffentlichen README.md (das Release-Skript benennt um).
+    readme_file = ROOT / "INSTALL.txt" if (ROOT / "INSTALL.txt").exists() else ROOT / "README.md"
+    readme = readme_file.read_text(encoding="utf-8")
     assert re.search(r"^mcp-name: %s$" % re.escape(server["name"]), readme, re.M)
 
 
