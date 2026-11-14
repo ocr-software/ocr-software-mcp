@@ -210,6 +210,27 @@ def test_path_errors_name_the_real_problem(fake, tmp_path, monkeypatch):
     assert fake.log == []
 
 
+def test_a_relative_path_gets_the_hint_to_give_an_absolute_one(fake):
+    with pytest.raises(ToolError, match=r"file not found: clean\.png\. Give an absolute path"):
+        call(server.quote, "clean.png", "p@1")
+
+
+def test_outside_the_allowed_folder_the_answer_is_the_same_for_every_path(fake, tmp_path, monkeypatch):
+    """Fund T12: an existing file, a folder and a missing path outside must not be told apart."""
+    (tmp_path / "ok").mkdir()
+    (tmp_path / "secret.pdf").write_bytes(PDF)
+    monkeypatch.setenv("OCR_ALLOWED_DIR", str(tmp_path / "ok"))
+    answers = set()
+    for outside in (tmp_path / "secret.pdf", tmp_path, tmp_path / "nope.pdf"):
+        with pytest.raises(ToolError, match="outside the allowed folder") as e:
+            call(server.quote, str(outside), "p@1")
+        answers.add(str(e.value).replace(str(outside), "X"))
+    assert len(answers) == 1
+    with pytest.raises(ToolError, match="file not found"):  # inside: the real problem is named
+        call(server.quote, str(tmp_path / "ok" / "nope.pdf"), "p@1")
+    assert fake.log == []
+
+
 def test_submit_binds_document_pipeline_and_price_to_the_quote(fake, doc):
     quote_id = quoted(fake, doc)
     fake.scripted[("POST", "/v1/jobs")] = [(202, {}, {"job_id": "j1", "state": "running", "pages": 42, "price_millicents": 4200})]
@@ -412,6 +433,16 @@ def test_get_result_of_an_unknown_job_goes_to_documents(fake, monkeypatch, tmp_p
     fake.scripted[("GET", "/v1/jobs/j9/result")] = [(200, {}, json.dumps(make_result(1)).encode())]
     out = call(server.get_result, "j9")
     assert Path(out["path"]) == (tmp_path / "Documents" / "ocr-results" / "j9.json").resolve()
+    assert "did not start this job" in out["note"] and str(Path(out["path"]).parent) in out["note"]
+
+
+def test_without_a_documents_folder_the_result_goes_to_the_home_folder_and_the_answer_says_where(fake, monkeypatch, tmp_path):
+    monkeypatch.delenv("OCR_OUT_DIR")
+    monkeypatch.setattr(server.Path, "home", classmethod(lambda cls: tmp_path))  # no Documents here (OneDrive redirect)
+    fake.scripted[("GET", "/v1/jobs/j9/result")] = [(200, {}, json.dumps(make_result(1)).encode())]
+    out = call(server.get_result, "j9")
+    assert Path(out["path"]) == (tmp_path / "ocr-results" / "j9.json").resolve() and str(tmp_path) in out["note"]
+    assert "note" not in call(server.get_result, "j9", out_dir=str(tmp_path / "mine"))  # the agent chose the place: no note
 
 
 def test_out_dir_belongs_to_the_human_first_and_stays_inside_the_allowed_folder(fake, tmp_path, monkeypatch):
@@ -508,6 +539,32 @@ def test_a_single_column_page_is_not_flagged_and_a_title_across_does_not_hide_tw
     assert server._multi_column(server._words(two), 1000)
 
 
+def test_a_short_two_column_page_is_flagged_and_the_hint_names_no_pipeline_that_reads_columns(fake):
+    page = make_result(1, columns=True, words_per_line=3)["pages"][0]
+    page["lines"] = page["lines"][:6]  # 3 rows, 2 columns, 18 words: the form of the finding T2 (22 words)
+    assert server._multi_column(server._words(page), 1000)
+    note = server._summary({"pipeline": "scan-ctc@2", "pages": [page]})["per_page"][0]["note"]
+    assert "scan-ctc@2 reads line by line" in note and "No pipeline of ours reads columns in order" in note
+    one_line = make_result(1, columns=True)["pages"][0]
+    one_line["lines"] = one_line["lines"][:2]  # one row with a wide gap (letterhead): no columns
+    assert not server._multi_column(server._words(one_line), 1000)
+
+
+GALLERY = HERE.parents[2] / "gold" / "ergebnisse" / "galerie" / "matrix-gpu-20261111"  # only in the monorepo, not in the GitHub mirror
+
+
+@pytest.mark.skipif(not GALLERY.is_dir(), reason="gold results are not in this checkout")
+def test_the_column_hint_comes_on_the_spread_only_not_on_tables_forms_or_head_boxes():
+    """Review 14.11.2026: the 26 scan-ctc@2 pages of the gallery. smoke07 is a spread (two pages side by side); smoke05 and smoke09
+    are tables, pd05 has a head box beside the title, pd15 is a form with a margin strip: no hint there (rather too rare than wrong)."""
+    flagged = []
+    for path in sorted(GALLERY.glob("*/scan-ctc-2.json")):
+        for page in json.loads(path.read_text(encoding="utf-8"))["pages"]:
+            if server._multi_column(server._words(page), page.get("width") or 0):
+                flagged.append(path.parent.name)
+    assert flagged == ["smoke07"]
+
+
 def test_pages_and_search_read_a_part_of_the_result_without_a_file(fake, tmp_path):
     fake.scripted[("GET", "/v1/jobs/j1/result")] = [(200, {}, json.dumps(make_result(5)).encode())]
     part = call(server.get_result, "j1", pages="2-3")
@@ -521,6 +578,19 @@ def test_pages_and_search_read_a_part_of_the_result_without_a_file(fake, tmp_pat
             call(server.get_result, "j1", pages=bad)
 
 
+def test_pages_and_search_reject_empty_values_missing_pages_and_options_that_do_not_apply(fake, tmp_path):
+    fake.scripted[("GET", "/v1/jobs/j1/result")] = [(200, {}, json.dumps(make_result(3)).encode())]
+    for kwargs, match in (({"search": ""}, "search is empty"), ({"search": "  "}, "search is empty"), ({"pages": ""}, "pages is empty"),
+                          ({"pages": "1", "search": "w1"}, "not both"), ({"pages": "1", "format": "hocr"}, "do not apply"),
+                          ({"search": "w1", "format": "json"}, "do not apply"), ({"pages": "1", "out_dir": str(tmp_path)}, "do not apply"),
+                          ({"pages": "99"}, "page 99 not in this job: it has 3 page"), ({"pages": "2-5"}, "page 4, 5 not in this job")):
+        with pytest.raises(ToolError, match=match):
+            call(server.get_result, "j1", **kwargs)
+    assert fake.log == [] or all(c["method"] == "GET" for c in fake.log)
+    assert not (tmp_path / "out").exists()  # nothing was written
+    assert call(server.get_result, "j1", pages="3")["text"].startswith("## Page 3")
+
+
 def test_uncertain_words_lists_the_least_sure_first_with_both_readings_and_boxes(fake):
     result = make_result(2, low=[(1, 3), (2, 5)])
     word = result["pages"][1]["lines"][1]["words"][0]
@@ -530,15 +600,31 @@ def test_uncertain_words_lists_the_least_sure_first_with_both_readings_and_boxes
     assert out["total"] == 3 and [w["confidence"] for w in out["words"]] == [0.5, 0.5, 0.95]
     flagged = out["words"][2]
     assert flagged["other_reading"] == "Iznos" and flagged["page"] == 2 and len(flagged["box"]) == 4
-    assert out["page_size"] == {1: [1000, 1000], 2: [1000, 1000]}
+    assert out["page_size"] == [{"page": 1, "width": 1000, "height": 1000}, {"page": 2, "width": 1000, "height": 1000}]  # page is a number as in words
     only = call(server.uncertain_words, "j1", pages="1", limit=1)
-    assert only["total"] == 1 and len(only["words"]) == 1 and list(only["page_size"]) == [1]
+    assert only["total"] == 1 and len(only["words"]) == 1 and [r["page"] for r in only["page_size"]] == [1]
+
+
+def test_uncertain_words_checks_its_limits_and_the_pages(fake):
+    fake.scripted[("GET", "/v1/jobs/j1/result")] = [(200, {}, json.dumps(make_result(2, low=[(1, 3)])).encode())]
+    for bad in (0, -1, 101):
+        with pytest.raises(ToolError, match="limit must be between 1 and 100"):
+            call(server.uncertain_words, "j1", limit=bad)
+    for bad in (-0.1, 1.5, float("nan")):
+        with pytest.raises(ToolError, match="max_confidence must be between 0 and 1"):
+            call(server.uncertain_words, "j1", max_confidence=bad)
+    assert call(server.uncertain_words, "j1", max_confidence=0)["total"] == 0
+    assert call(server.uncertain_words, "j1", limit=100)["total"] == 1
+    with pytest.raises(ToolError, match="pages must look like"):  # an empty string is no "not set"
+        call(server.uncertain_words, "j1", pages="")
+    with pytest.raises(ToolError, match="page 7 not in this job: it has 2 page"):
+        call(server.uncertain_words, "j1", pages="1,7")
 
 
 def test_initialize_reports_our_version_and_the_order_of_the_tools():
     """Customer test 12.11.2026: serverInfo said 1.30.0 (the SDK) and gave no instructions."""
     options = server.mcp._mcp_server.create_initialization_options()
-    assert options.server_version == server.__version__ == "0.1.0"
+    assert options.server_version == server.__version__ == "0.2.0"
     assert "quote" in options.instructions and "human_confirmed" in options.instructions and "say_to_human" in options.instructions
 
 

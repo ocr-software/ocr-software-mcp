@@ -86,14 +86,24 @@ async def _call(func, *args, **kwargs):
         raise _tool_error(e)
 
 
+def _allowed_dir():
+    return os.environ.get("OCR_ALLOWED_DIR") or os.environ.get("OCR_SOFTWARE_ALLOWED_DIR")
+
+
 def _check_path(path):
-    """Say what is wrong with a path before the client reports a generic 'not a file'."""
+    """Say what is wrong with a path before the client reports a generic 'not a file'. The allowed folder is checked first,
+    so outside of it the answer is the same whether the path exists or not."""
+    allowed = _allowed_dir()
+    if allowed and not _inside(path, allowed):
+        raise ToolError("file is outside the allowed folder: %s" % path)
     if os.path.isdir(path):
         raise ToolError("this is a folder, not a document: %s. Give the path of one PDF, PNG, JPEG or TIFF file." % path)
     if not os.path.exists(path):
         hint = ""
         if os.name == "nt" and re.match(r"^/[A-Za-z]/", path):
             hint = " It looks like a Git Bash path; on Windows give C:/Users/... or C:\\Users\\..."
+        elif not os.path.isabs(path):
+            hint = " Give an absolute path: a relative one is resolved against the working folder of the server, which you do not know."
         raise ToolError("file not found: %s.%s" % (path, hint))
 
 
@@ -173,7 +183,7 @@ def _out_folder(job_id, requested):
     if requested:
         if configured:
             raise ToolError("OCR_OUT_DIR is set by the human; do not pass out_dir.")
-        allowed = os.environ.get("OCR_ALLOWED_DIR") or os.environ.get("OCR_SOFTWARE_ALLOWED_DIR")
+        allowed = _allowed_dir()
         folder = base / requested
         if allowed and not _inside(folder, allowed):
             raise ToolError("out_dir is outside the allowed folder.")
@@ -208,24 +218,53 @@ def _uncertain(word):
     return word["confidence"] < LOW_CONFIDENCE or word.get("flag") in UNCERTAIN_FLAGS
 
 
+def _row_groups(items):
+    """Group (box, ...) items into text rows: a new row starts when a box begins more than 0.6 box heights below the row's first."""
+    height = sorted(i[0][3] - i[0][1] for i in items)[len(items) // 2] or 1
+    rows, start = [], None
+    for item in sorted(items, key=lambda i: i[0][1]):
+        if start is None or item[0][1] - start > 0.6 * height:
+            rows.append([])
+            start = item[0][1]
+        rows[-1].append(item)
+    return rows
+
+
 def _multi_column(words, width):
-    """Hint, not proof: a vertical band of 4 percent of the page width between 20 and 80 percent stays empty in (nearly) every
-    line and enough words stand on both sides. scan-ctc reads such a page line by line across the columns."""
-    boxes = [w["box"] for w in words if w.get("box")]
-    if len(boxes) < 60 or not width:
+    """Hint, not proof, and rather too rare than wrong. A vertical band between 20 and 80 percent of the page width stays empty
+    in (nearly) every row, enough words stand on both sides in at least two rows each, and one of two things holds:
+    the gutter is wide (8 percent or more: a spread, or a clear column gap), or it is text in columns: most rows have words on
+    both sides and few words are numbers (a table has narrow gaps and numbers, a form has a head box or a margin strip with
+    one side in few rows). Checked against the 26 scan-ctc@2 pages of gold/ergebnisse/galerie/matrix-gpu-20261111: only smoke07.
+    Pipelines read such a page line by line across the columns. From 12 words on, so short forms and invoice heads count too."""
+    items = [(w["box"], w) for w in words if w.get("box")]
+    if len(items) < 12 or not width:
         return False
+    boxes = [i[0] for i in items]
     bins = 50
     cover = [0] * bins
     for x0, _, x1, _ in boxes:
         for b in range(max(0, int(x0 / width * bins)), min(bins - 1, int(x1 / width * bins)) + 1):
             cover[b] += 1
     free = [b for b in range(10, 41) if cover[b] <= len(boxes) * 0.03]
-    for b in free:
-        if b + 1 in free:
-            left = sum(1 for box in boxes if box[2] <= (b + 1) * width / bins)
-            right = sum(1 for box in boxes if box[0] >= (b + 1) * width / bins)
-            if left >= len(boxes) * 0.25 and right >= len(boxes) * 0.25:
-                return True
+    rows = _row_groups(items)
+    numbers = sum(1 for _, w in items if not any(c.isalpha() for c in w["text"])) / len(items)
+    for start in free:
+        if start - 1 in free:
+            continue  # a gap is looked at once, from its first bin
+        end = start
+        while end + 1 in free:
+            end += 1
+        if end == start:
+            continue
+        x = (start + end + 1) / 2 * width / bins  # middle of the gap
+        left = [i for i in items if i[0][2] <= x]
+        right = [i for i in items if i[0][0] >= x]
+        if min(len(left), len(right)) < len(items) * 0.25 or min(len(_row_groups(left)), len(_row_groups(right))) < 2:
+            continue
+        both = sum(1 for row in rows if any(i[0][2] <= x for i in row) and any(i[0][0] >= x for i in row)) / len(rows)
+        if end - start + 1 >= 4 or (both >= 0.6 and numbers < 0.3):
+            return True
     return False
 
 
@@ -242,8 +281,9 @@ def _summary(result):
         elif not words:
             notes.append("no words found")
         if _multi_column(words, page.get("width") or max((w["box"][2] for w in words if w.get("box")), default=0)):
-            notes.append("probably several columns: scan-ctc reads line by line across them, the order of the text may be mixed; "
-                         "tell the human, another pipeline may read columns in order")
+            notes.append("probably several columns: %s reads line by line across them and the order of the text may be mixed. "
+                         "No pipeline of ours reads columns in order today (all three mix them): tell the human, and use the word boxes "
+                         "(box x0) to tell the columns apart" % (result.get("pipeline") or "the pipeline"))
         notes += [w["code"] for w in page.get("warnings", [])]
         if mean is not None and mean < LOW_CONFIDENCE:
             notes.append("low mean confidence")
@@ -267,6 +307,16 @@ def _page_numbers(spec):
             raise ToolError("pages must look like 3 or 1-5 or 2,4,7-9")
         numbers.update(range(int(m.group(1)), int(m.group(2) or m.group(1)) + 1))
     return sorted(numbers)
+
+
+def _wanted_pages(spec, result):
+    """The page numbers of spec; one the job does not have is an error that names the page count (empty text would look like an empty page)."""
+    wanted = _page_numbers(spec)
+    have = {p["page"] for p in result["pages"]}
+    missing = [n for n in wanted if n not in have]
+    if missing:
+        raise ToolError("page %s not in this job: it has %d page(s), numbered from 1." % (", ".join(map(str, missing)), len(have)))
+    return wanted
 
 
 def _page_text(page):
@@ -298,7 +348,11 @@ def _deliver(client, job_id, fmt, out_dir, source_path):
     else:
         data = client.result(job_id, fmt)
     path = _write_new(_out_folder(job_id, out_dir), job_id, RESULT_EXT[fmt], data)
-    return {"path": path, "bytes": len(data), "format": fmt, "check": _summary(parsed)}
+    out = {"path": path, "bytes": len(data), "format": fmt, "check": _summary(parsed)}
+    if job_id not in _job_files and not out_dir and not os.environ.get("OCR_OUT_DIR"):
+        out["note"] = ("this server did not start this job (or it restarted), so the file is not next to the document: it is in %s. "
+                       "Pass out_dir, or ask the human to set OCR_OUT_DIR." % Path(path).parent)
+    return out
 
 
 async def _finish(client, job_id, fmt, out_dir, source_path=None):
@@ -413,22 +467,29 @@ async def job_status(job_id: str, wait_seconds: int = 45, format: str | None = N
 
 
 @mcp.tool()
-async def get_result(job_id: str, format: str = "json", pages: str | None = None, search: str | None = None,
+async def get_result(job_id: str, format: str | None = None, pages: str | None = None, search: str | None = None,
                      out_dir: str | None = None, source_path: str | None = None) -> dict:
     """Result of a finished job. Default: write it to a file (format json, text, md, hocr or pdf) and return path, size and
     check: words, mean confidence and uncertain words per page, notes such as probably several columns. The content stays
     out of the chat. pages ('3', '1-5') returns the text of those pages here, search returns the matching lines with
-    page numbers, neither writes a file. out_dir: folder for the file, default ocr-results next to the document. pdf (searchable PDF)
+    page numbers, neither writes a file (give neither format, out_dir nor source_path then). out_dir: folder for the file, default ocr-results next to the document. pdf (searchable PDF)
     needs the original: source_path, or the file of a job started by this server. Results expire after about 24 hours.
     In the json: confidence is 0 to 1, box is [x0,y0,x1,y1] in pixels of the page image (page width, height). verified (per word) is
     true only where a second reader confirmed it (scan-vlm-ctc@2); safe_ok (per page) is always false today. Judge by confidence."""
     _check_format(format)
+    for name, value in (("pages", pages), ("search", search)):
+        if value is not None and not value.strip():
+            raise ToolError("%s is empty: leave it out, or give %s." % (name, "pages like 3 or 1-5" if name == "pages" else "the text to look for"))
+    if pages is None and search is None:
+        return await _finish(_client(), job_id, format or "json", out_dir, source_path)
+    if pages is not None and search is not None:
+        raise ToolError("give pages or search, not both.")
+    if format or out_dir or source_path:
+        raise ToolError("format, out_dir and source_path do not apply to pages or search: they return text here and write no file. Leave them out.")
     client = _client()
-    if not (pages or search):
-        return await _finish(client, job_id, format, out_dir, source_path)
     result = (await _call(_load_result, client, job_id))[1]
-    if pages:
-        wanted = _page_numbers(pages)
+    if pages is not None:
+        wanted = _wanted_pages(pages, result)
         text = "\n\n".join("## Page %d\n%s" % (p["page"], _page_text(p)) for p in result["pages"] if p["page"] in wanted)
         return {"text": text[:INLINE_CHARS], "truncated": len(text) > INLINE_CHARS}
     needle = search.lower()
@@ -441,11 +502,15 @@ async def uncertain_words(job_id: str, max_confidence: float = LOW_CONFIDENCE, l
     """Words the OCR read with low confidence (below max_confidence, default 0.9: the words of the gold set that were really
     wrong sat at about 0.83) or flagged as differing readings (scan-vlm-ctc), least
     sure first: page, word, confidence, other_reading if there is a second one, and box [x0,y0,x1,y1] in pixels of the page
-    image (page_size gives width and height). Check these against the image of the page, do not trust them blindly, and tell
-    the human what you corrected. Needs a finished job."""
+    image (page_size: width and height per page). Check these against the image of the page, do not trust them blindly, and tell
+    the human what you corrected. limit 1 to 100, max_confidence 0 to 1. Needs a finished job."""
+    if not 0 <= max_confidence <= 1:
+        raise ToolError("max_confidence must be between 0 and 1 (confidence is 0 to 1).")
+    if not 1 <= limit <= 100:
+        raise ToolError("limit must be between 1 and 100.")
     client = _client()
     result = (await _call(_load_result, client, job_id))[1]
-    wanted = set(_page_numbers(pages)) if pages else None
+    wanted = set(_wanted_pages(pages, result)) if pages is not None else None
     found, sizes = [], {}
     for page in result["pages"]:
         if wanted is not None and page["page"] not in wanted:
@@ -460,8 +525,9 @@ async def uncertain_words(job_id: str, max_confidence: float = LOW_CONFIDENCE, l
                 found.append(row)
                 sizes[page["page"]] = [page.get("width"), page.get("height")]
     found.sort(key=lambda r: r["confidence"])
-    shown = found[:max(1, min(100, limit))]
-    return {"total": len(found), "words": shown, "page_size": {p: sizes[p] for p in sorted({r["page"] for r in shown})}}
+    shown = found[:limit]
+    return {"total": len(found), "words": shown,
+            "page_size": [{"page": p, "width": sizes[p][0], "height": sizes[p][1]} for p in sorted({r["page"] for r in shown})]}
 
 
 def main():
